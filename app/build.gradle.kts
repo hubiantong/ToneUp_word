@@ -69,12 +69,14 @@ android {
         applicationId = "top.toneup.word"
         minSdk = 26
         targetSdk = 36
+        // 1.0.5：新增可选的 Edge 在线朗读（失败回退系统语音）、每日学习可限定单个词库、
+        // 写词库可指定目标词库、学习卡片左右滑动翻页；修复自适应图标裁切与翻到下一词时释义残留。
         // 1.0.4：学习范围从词库迁移至「计划」（schema v4）、TTS 语音 fallback 链并显示实际语音；
         // 1.0.3 新增应用内自动更新（version.json + SHA-256 + 断点续传）。
         // versionCode 自 1.0.3 起按 major*100 + minor*10 + patch 计算，与 Release tag v<versionName>
         // 和 version.json 对齐，tool/release.ps1 会校验三者一致，不要单独手改其中之一。
-        versionCode = 104
-        versionName = "1.0.4"
+        versionCode = 105
+        versionName = "1.0.5"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
     }
