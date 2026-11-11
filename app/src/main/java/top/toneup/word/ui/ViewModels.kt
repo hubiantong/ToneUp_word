@@ -7,9 +7,13 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import top.toneup.word.AppContainer
+import top.toneup.word.core.result.ErrorCode
 import top.toneup.word.core.result.Outcome
 import top.toneup.word.core.time.StudyDay
+import top.toneup.word.data.gateway.MeaningStates
 import top.toneup.word.data.repository.AnswerSource
+import top.toneup.word.data.repository.DictionaryHit
+import top.toneup.word.data.repository.DictionarySearchRepository
 import top.toneup.word.data.repository.ExamDraft
 import top.toneup.word.data.repository.ExamStatus
 import top.toneup.word.data.repository.ExportScope
@@ -70,14 +74,18 @@ import top.toneup.word.domain.study.StudySessionState
 import top.toneup.word.domain.study.TodayPlan
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -2274,13 +2282,34 @@ class ImportWordsViewModel(
 // Write word (手写录词) — the「写词库」tab
 // ---------------------------------------------------------------------------------------------
 
-/** One word the learner typed during this visit; kept so the screen can list "本次已写入". */
+/** One word the learner typed during this visit, projected from its live `word` row. */
 @Immutable
 data class WrittenWordEntry(
     val wordId: Long,
     val word: String,
+    /** The learner's own note (`user_note`); wins over the dictionary meaning on display. */
     val note: String,
-)
+    /** First looked-up meaning; empty until the gateway write-back lands. */
+    val meaning: String = "",
+    /** NONE / OK / PENDING / FAILED — the row's meaning-completion state (D4). */
+    val lookupState: String = "",
+) {
+    /**
+     * The text shown next to the word: the learner's note first (its whole point is to override
+     * the dictionary reading), then the looked-up meaning, and a placeholder while the gateway
+     * still owes an answer.
+     */
+    val secondaryText: String?
+        get() = when {
+            note.isNotBlank() -> note
+            meaning.isNotBlank() -> meaning
+            lookupState == MeaningStates.PENDING || lookupState == MeaningStates.FAILED -> "释义待补全"
+            else -> null
+        }
+
+    /** True when [secondaryText] is the learner's note and should use the normal text colour. */
+    val secondaryIsNote: Boolean get() = note.isNotBlank()
+}
 
 @Immutable
 data class WriteWordUiState(
@@ -2300,15 +2329,23 @@ data class WriteWordUiState(
     val saving: Boolean = false,
     /** Most recent writes first, capped at [WriteWordViewModel.MAX_RECENT]. */
     val written: List<WrittenWordEntry> = emptyList(),
+    // --- full-screen dictionary picker (P2) ---------------------------------------------
+    /** True while the full-screen picker replaces the form. */
+    val searchVisible: Boolean = false,
+    val searchQuery: String = "",
+    val searchLoading: Boolean = false,
+    val searchHits: List<DictionaryHit> = emptyList(),
+    val searchError: String? = null,
+    /** True when [searchError] is a gateway configuration problem (401 / bad URL / key). */
+    val searchErrorIsConfig: Boolean = false,
+    /**
+     * True once a response for the *current* query has landed. Until then an empty
+     * [searchHits] means "still typing", not "no such word".
+     */
+    val searchSettled: Boolean = false,
     val message: String? = null,
     /** True when [message] reports a refusal or a failed write; false after a success. */
     val messageIsError: Boolean = false,
-    /**
-     * Bumped on every successful write. The screen keys its "return the cursor to the word
-     * field" effect on this value so each commit re-focuses exactly once, without collapsing
-     * the keyboard (write-word UX: focus must snap back for the next word).
-     */
-    val commitTick: Int = 0,
     /**
      * Distinct words written during this visit (deduplicated by row id, so writing the same
      * word twice counts once) — shown as「本次已写入 · N 词」. Unlike [written] this is not
@@ -2330,13 +2367,19 @@ data class WriteWordUiState(
  * the learner can keep the default「手写词」pack or pick any pack of the plan, and the words land
  * in that pack (the plan only owns the pack).
  */
+@OptIn(kotlinx.coroutines.FlowPreview::class, kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class WriteWordViewModel(
     private val container: AppContainer,
     /** The gateway seam — injectable so the write path can be tested without WorkManager. */
     private val meaningSync: MeaningSyncRepository = container.meaningSync,
+    /** `/dict` used as a plain search; injectable so tests never touch the network. */
+    private val dictionarySearch: DictionarySearchRepository = container.dictionarySearchRepository,
+    /** Keystroke → request delay; a test shortens it instead of sleeping for a quarter second. */
+    private val searchDebounceMillis: Long = SEARCH_DEBOUNCE_MILLIS,
 ) : ViewModel() {
 
     private val _input = MutableStateFlow(WriteWordInput())
+    private val _search = MutableStateFlow(SearchInput())
 
     private data class WriteWordInput(
         val word: String = "",
@@ -2344,13 +2387,49 @@ class WriteWordViewModel(
         /** Empty = the lazy「手写词」pack; otherwise a pack id from [packs]. */
         val targetPackId: String = "",
         val saving: Boolean = false,
-        val written: List<WrittenWordEntry> = emptyList(),
+        /**
+         * Row ids written during this visit, newest first and capped at [MAX_RECENT] — the
+         * screen observes exactly these rows, so a gateway write-back appears without a reload.
+         */
+        val recentWordIds: List<Long> = emptyList(),
         val message: String? = null,
         val messageIsError: Boolean = false,
-        val commitTick: Int = 0,
         /** Row ids written during this visit — a [Set] so repeats count as one word. */
         val sessionWordIds: Set<Long> = emptySet(),
     )
+
+    private data class SearchInput(
+        val visible: Boolean = false,
+        val query: String = "",
+        val loading: Boolean = false,
+        val hits: List<DictionaryHit> = emptyList(),
+        val error: String? = null,
+        val errorIsConfig: Boolean = false,
+        val settled: Boolean = false,
+        /** Bumped by "重试" so the same query can be requested again after a failure. */
+        val retryTick: Int = 0,
+    )
+
+    /**
+     * Live projection of the rows written during this visit.
+     *
+     * The list must show meanings the gateway stores *after* the word was written (and while the
+     * learner stays on this page), so it cannot be an in-memory copy — it observes the rows. The
+     * ids only change on a successful write, hence the `distinctUntilChanged` before subscribing.
+     */
+    private val writtenEntries: Flow<List<WrittenWordEntry>> = _input
+        .map { it.recentWordIds }
+        .distinctUntilChanged()
+        .flatMapLatest { ids ->
+            if (ids.isEmpty()) {
+                flowOf(emptyList<WrittenWordEntry>())
+            } else {
+                container.wordRepository.observeWordsByIds(ids).map { words ->
+                    val byId = words.associateBy { it.id }
+                    ids.mapNotNull { id -> byId[id]?.toWrittenEntry() }
+                }
+            }
+        }
 
     /**
      * The plan name is resolved from [WordRepository.observePlans] instead of a suspending
@@ -2366,8 +2445,10 @@ class WriteWordViewModel(
         container.settingsRepository.settings.flatMapLatest { settings ->
             container.wordRepository.observePacks(settings.effectivePlanId)
         },
-        _input,
-    ) { settings, plans, packs, input ->
+        combine(_input, _search) { input, search -> input to search },
+        writtenEntries,
+    ) { settings, plans, packs, form, written ->
+        val (input, search) = form
         // A pack id is only meaningful inside its plan: after a plan switch, fall back to the
         // default「手写词」pack instead of writing into a pack this plan cannot see.
         val selectedPackId = input.targetPackId.takeIf { id -> packs.any { it.id == id } }.orEmpty()
@@ -2380,22 +2461,187 @@ class WriteWordViewModel(
             wordInput = input.word,
             noteInput = input.note,
             saving = input.saving,
-            written = input.written,
+            written = written,
+            searchVisible = search.visible,
+            searchQuery = search.query,
+            searchLoading = search.loading,
+            searchHits = search.hits,
+            searchError = search.error,
+            searchErrorIsConfig = search.errorIsConfig,
+            searchSettled = search.settled,
             message = input.message,
             messageIsError = input.messageIsError,
-            commitTick = input.commitTick,
             sessionCount = input.sessionWordIds.size,
         )
     }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), WriteWordUiState())
 
-    fun onWordChanged(value: String) =
-        _input.update { it.copy(word = value, message = null, messageIsError = false) }
+    init {
+        // Debounce → one in-flight request: a new query cancels the previous call
+        // (`collectLatest`), and the guard inside the response handlers drops a late answer
+        // that belongs to an older query during the debounce window.
+        viewModelScope.launch {
+            _search
+                .map { it.query.trim() to it.retryTick }
+                .distinctUntilChanged()
+                .debounce(searchDebounceMillis)
+                .collectLatest { (query, _) ->
+                    if (query.isEmpty()) {
+                        _search.update {
+                            it.copy(
+                                loading = false,
+                                hits = emptyList(),
+                                error = null,
+                                errorIsConfig = false,
+                                settled = false,
+                            )
+                        }
+                        return@collectLatest
+                    }
+                    _search.update {
+                        it.copy(loading = true, error = null, errorIsConfig = false, settled = false)
+                    }
+                    when (val result = dictionarySearch.search(query)) {
+                        is Outcome.Success -> _search.update {
+                            if (it.query.trim() != query) {
+                                it
+                            } else {
+                                it.copy(loading = false, hits = result.value, settled = true)
+                            }
+                        }
+
+                        is Outcome.Failure -> _search.update {
+                            if (it.query.trim() != query) {
+                                it
+                            } else {
+                                it.copy(
+                                    loading = false,
+                                    hits = emptyList(),
+                                    error = result.error.message,
+                                    errorIsConfig = result.error.code == ErrorCode.CONFIG,
+                                    settled = true,
+                                )
+                            }
+                        }
+                    }
+                }
+        }
+    }
 
     fun onNoteChanged(value: String) = _input.update { it.copy(note = value) }
 
     /** Picks the target pack; empty goes back to the lazy「手写词」pack. */
     fun selectPack(packId: String) = _input.update { it.copy(targetPackId = packId) }
+
+    /**
+     * Creates a pack inside the active plan and makes it the write target.
+     *
+     * The pack appears through `observePacks`; setting the id now is enough — the state
+     * pipeline keeps it only once the pack is actually visible in this plan.
+     */
+    fun createPack(name: String) {
+        viewModelScope.launch {
+            val planId = container.settingsRepository.current().effectivePlanId
+            when (
+                val created = container.wordRepository.createPack(
+                    name = name,
+                    planId = planId,
+                    now = container.timeProvider.nowMillis(),
+                )
+            ) {
+                is Outcome.Failure -> _input.update {
+                    it.copy(message = created.error.message, messageIsError = true)
+                }
+
+                is Outcome.Success -> _input.update {
+                    it.copy(
+                        targetPackId = created.value,
+                        message = "已新建词库「${name.trim()}」，后续单词将写入这里。",
+                        messageIsError = false,
+                    )
+                }
+            }
+        }
+    }
+
+    // --- full-screen dictionary picker -------------------------------------------------------
+
+    /** Enters the picker with the form's current word as the first query. */
+    fun openSearch() {
+        val initialQuery = _input.value.word
+        _search.update {
+            it.copy(
+                visible = true,
+                query = initialQuery,
+                // A non-empty carried-over word means a request is queued; show the inline
+                // indicator right away instead of a blank list for one debounce window.
+                loading = initialQuery.isNotBlank(),
+                hits = emptyList(),
+                error = null,
+                errorIsConfig = false,
+                settled = false,
+                // Force a fresh request even when the form word equals the last search.
+                retryTick = it.retryTick + 1,
+            )
+        }
+    }
+
+    /**
+     * Leaves the picker without touching the form's word.
+     *
+     * The query and hits stay in the state on purpose: the screen's exit animation still draws
+     * the picker for one transition, and an emptied list would make it fade out blank. Opening
+     * again resets them in [openSearch].
+     */
+    fun closeSearch() {
+        _search.update { it.copy(visible = false, loading = false) }
+    }
+
+    fun onSearchQueryChanged(value: String) {
+        _search.update {
+            it.copy(
+                query = value,
+                // The request starts after the debounce; flagging it now avoids a blank list
+                // between the keystroke and the actual call.
+                loading = value.isNotBlank(),
+                hits = emptyList(),
+                error = null,
+                errorIsConfig = false,
+                settled = false,
+            )
+        }
+    }
+
+    fun clearSearchQuery() = onSearchQueryChanged("")
+
+    /**
+     * System back inside the picker: the first press clears the text, the next leaves the
+     * picker — it never pops the whole「写词库」page.
+     */
+    fun onSearchBack() {
+        if (_search.value.query.isNotEmpty()) clearSearchQuery() else closeSearch()
+    }
+
+    fun retrySearch() {
+        _search.update {
+            it.copy(retryTick = it.retryTick + 1, loading = true, error = null, errorIsConfig = false)
+        }
+    }
+
+    /** Picks a candidate: only fills the form, so the learner can still add a note. */
+    fun selectSearchHit(hit: DictionaryHit) {
+        if (hit.word.isBlank()) return
+        _input.update { it.copy(word = hit.word, message = null, messageIsError = false) }
+        closeSearch()
+    }
+
+    /** The always-available fallback: use whatever was typed, even offline / not in ECDICT. */
+    fun useTypedWord() {
+        val word = _search.value.query.trim()
+        if (word.isEmpty()) return
+        _input.update { it.copy(word = word, message = null, messageIsError = false) }
+        closeSearch()
+    }
 
     /** Writes the current word + note, then clears the fields so the next word can be typed. */
     fun write() {
@@ -2411,9 +2657,14 @@ class WriteWordViewModel(
         _input.update { it.copy(saving = true, message = null, messageIsError = false) }
         viewModelScope.launch {
             val planId = container.settingsRepository.current().effectivePlanId
-            // A pack id is only meaningful inside its plan: after a plan switch, fall back to the
-            // default「手写词」pack instead of writing into a pack this plan cannot see.
-            val selectedPackId = state.value.targetPackId
+            // A pack id is only meaningful inside its plan. Reading the *input* (not the derived
+            // state) also covers the short window right after `createPack`, when the row is
+            // already in the database but `observePacks` has not emitted it yet; the plan check
+            // keeps the plan-switch guard intact.
+            val desiredPackId = _input.value.targetPackId
+            val selectedPackId = desiredPackId.takeIf { id ->
+                id.isNotEmpty() && container.wordRepository.packById(id)?.planId == planId
+            }.orEmpty()
             val packId = if (selectedPackId.isNotEmpty()) {
                 selectedPackId
             } else {
@@ -2446,12 +2697,8 @@ class WriteWordViewModel(
                     // A word typed without a note is filled in later by the gateway; a failed
                     // enqueue only delays completion, never data (plan §7.3).
                     meaningSync.enqueueAll()
-                    val entry = WrittenWordEntry(
-                        wordId = result.value,
-                        word = word,
-                        note = current.note.trim(),
-                    )
                     _input.update {
+                        val wordId = result.value
                         it.copy(
                             saving = false,
                             word = "",
@@ -2459,17 +2706,14 @@ class WriteWordViewModel(
                             // Identity is (pack, normalized word), so writing the same word twice
                             // returns the same row id — drop the stale line first, otherwise the
                             // LazyColumn would be handed a duplicate key and throw.
-                            written = (
-                                listOf(entry) +
-                                    it.written.filterNot { old -> old.wordId == entry.wordId }
+                            recentWordIds = (
+                                listOf(wordId) + it.recentWordIds.filterNot { old -> old == wordId }
                                 ).take(MAX_RECENT),
                             message = "已写入「$word」。",
                             messageIsError = false,
-                            // The commit tick (one per successful write) drives the screen's
-                            // refocus effect; the distinct-word set sizes the
-                            // 「本次已写入 · N 词」header — writing the same word twice counts once.
-                            commitTick = it.commitTick + 1,
-                            sessionWordIds = it.sessionWordIds + entry.wordId,
+                            // The distinct-word set sizes the「本次已写入 · N 词」header —
+                            // writing the same word twice counts once.
+                            sessionWordIds = it.sessionWordIds + wordId,
                         )
                     }
                 }
@@ -2480,5 +2724,16 @@ class WriteWordViewModel(
     companion object {
         /** How many freshly written words the screen keeps on show. */
         const val MAX_RECENT = 20
+
+        /** Keystroke → gateway delay (network, so slightly longer than a local search). */
+        const val SEARCH_DEBOUNCE_MILLIS = 250L
     }
 }
+
+private fun Word.toWrittenEntry(): WrittenWordEntry = WrittenWordEntry(
+    wordId = id,
+    word = word,
+    note = userNote,
+    meaning = meanings.firstOrNull().orEmpty(),
+    lookupState = lookupState,
+)

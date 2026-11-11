@@ -1,5 +1,15 @@
 package top.toneup.word.ui.screens
 
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -9,19 +19,29 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuAnchorType
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -29,6 +49,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -51,7 +72,9 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.times
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -60,6 +83,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import top.toneup.word.AppContainer
 import top.toneup.word.data.local.entity.PlanEntity
 import top.toneup.word.data.local.entity.WordPackEntity
+import top.toneup.word.data.repository.DictionaryHit
 import top.toneup.word.data.settings.PlanIds
 import top.toneup.word.domain.model.CetLevel
 import top.toneup.word.ui.ImportWordsViewModel
@@ -68,12 +92,12 @@ import top.toneup.word.ui.PlanListViewModel
 import top.toneup.word.ui.PlanRowUi
 import top.toneup.word.ui.ViewModelFactories
 import top.toneup.word.ui.WriteWordViewModel
+import top.toneup.word.ui.WriteWordUiState
 import top.toneup.word.ui.WrittenWordEntry
 import top.toneup.word.ui.components.AccentPanel
 import top.toneup.word.ui.components.AppCard
 import top.toneup.word.ui.components.ConfirmDialog
 import top.toneup.word.ui.components.EmptyState
-import top.toneup.word.ui.components.FilterChipGroup
 import top.toneup.word.ui.components.PrimaryButton
 import top.toneup.word.ui.components.ReviewBadge
 import top.toneup.word.ui.components.SecondaryButton
@@ -912,6 +936,10 @@ private const val InlineStatusLines = 2
  * `user_note` and shown **before** the looked-up meanings on the study card (see
  * `WordCard.WordMeaningBlock`). A word left without a note is completed by the gateway exactly
  * like an imported word — this screen therefore stays fully offline until the gateway runs.
+ *
+ * Two modes share one ViewModel and one screen (`AnimatedContent`, no extra navigation route):
+ * the form, and the full-screen gateway picker opened by tapping the word field. The picker only
+ * fills the word — the write itself keeps its original semantics (identity, note, lazy pack).
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -921,34 +949,76 @@ fun WriteWordScreen(
     val viewModel: WriteWordViewModel =
         viewModel(factory = ViewModelFactories.writeWord(container))
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val motion = AppTheme.motion
 
-    // No focus request on entry: pulling focus (and the IME) up during the navigation transition
-    // resizes the entering screen mid-animation — the very jump this screen is meant to fix.
-    // The cursor is returned after each successful write instead.
-    val wordFocus = remember { FocusRequester() }
-    val keyboard = LocalSoftwareKeyboardController.current
+    AnimatedContent(
+        targetState = state.searchVisible,
+        transitionSpec = {
+            val duration = motion.durationMillis(WriteWordTransitionMillis)
+            if (targetState) {
+                // Entering the picker: slide in from the reading direction, form slides back.
+                (fadeIn(tween(duration)) + slideInHorizontally(tween(duration)) { it / 16 })
+                    .togetherWith(
+                        fadeOut(tween(duration)) + slideOutHorizontally(tween(duration)) { -it / 16 },
+                    )
+            } else {
+                // Returning to the form: the same axis, reversed.
+                (fadeIn(tween(duration)) + slideInHorizontally(tween(duration)) { -it / 16 })
+                    .togetherWith(
+                        fadeOut(tween(duration)) + slideOutHorizontally(tween(duration)) { it / 16 },
+                    )
+            }
+        },
+        label = "write-word-mode",
+        modifier = Modifier.fillMaxSize(),
+    ) { searching ->
+        if (searching) {
+            WordSearchMode(
+                query = state.searchQuery,
+                hits = state.searchHits,
+                loading = state.searchLoading,
+                error = state.searchError,
+                errorIsConfig = state.searchErrorIsConfig,
+                settled = state.searchSettled,
+                onQueryChange = viewModel::onSearchQueryChanged,
+                onClear = viewModel::clearSearchQuery,
+                onBack = viewModel::closeSearch,
+                onRetry = viewModel::retrySearch,
+                onSelect = viewModel::selectSearchHit,
+                onUseTyped = viewModel::useTypedWord,
+            )
+        } else {
+            WriteWordForm(
+                state = state,
+                onOpenSearch = viewModel::openSearch,
+                onSelectPack = viewModel::selectPack,
+                onCreatePack = viewModel::createPack,
+                onNoteChanged = viewModel::onNoteChanged,
+                onWrite = viewModel::write,
+            )
+        }
+    }
+}
+
+/** One shared-axis pass between the form and the picker (disabled with the app's motion setting). */
+private const val WriteWordTransitionMillis = 220
+
+@Composable
+private fun WriteWordForm(
+    state: WriteWordUiState,
+    onOpenSearch: () -> Unit,
+    onSelectPack: (String) -> Unit,
+    onCreatePack: (String) -> Unit,
+    onNoteChanged: (String) -> Unit,
+    onWrite: () -> Unit,
+) {
+    var showCreateDialog by remember { mutableStateOf(false) }
     // Fixed status-slot height, derived from the typography line height: the line height is in
     // sp, and `toDp()` folds the system font scale in, so large-font users get a taller fixed
     // slot instead of clipped glyphs. The height still never depends on the message itself, so
     // the "appears without moving anything" guarantee is kept.
     val statusSlotHeight = with(LocalDensity.current) {
         (MaterialTheme.typography.bodySmall.lineHeight * InlineStatusLines.toFloat()).toDp()
-    }
-    val commitTick = state.commitTick
-    LaunchedEffect(commitTick) {
-        if (commitTick == 0) return@LaunchedEffect
-        try {
-            wordFocus.requestFocus()
-        } catch (_: IllegalStateException) {
-            // The input card was recycled by the LazyColumn between commit and now — the word
-            // was saved, there is simply nothing to refocus. Don't break the flow over it.
-        }
-        // Unconditional on purpose: the learner has just committed and the next step is typing
-        // the next word, so an IME that collapsed itself on IME_ACTION_DONE is brought back up
-        // (`requestFocus()` alone cannot — the field never lost focus, so nothing changes).
-        // This also re-shows a keyboard the learner dismissed by gesture; accepted on a tab
-        // whose only job is typing. The app itself never hides the keyboard.
-        keyboard?.show()
     }
 
     Scaffold(
@@ -961,6 +1031,7 @@ fun WriteWordScreen(
             )
         },
         containerColor = MaterialTheme.colorScheme.background,
+        modifier = Modifier.fillMaxSize(),
     ) { padding ->
         LazyColumn(
             modifier = Modifier
@@ -974,80 +1045,23 @@ fun WriteWordScreen(
             ),
             verticalArrangement = Arrangement.spacedBy(Spacing.md),
         ) {
-            item(key = "write_pack_hint") {
-                AccentPanel {
-                    Text(
-                        // Words live in packs, packs live in plans: name the pack first and the
-                        // plan only as its owner, so "写词库" never reads as "写入计划".
-                        text = "写入到词库：${state.targetPackName}" +
-                            state.planName.ifBlank { state.planId }.takeIf { it.isNotBlank() }
-                                ?.let { "（所属计划：$it）" }
-                                .orEmpty(),
-                        style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.testTag("write_pack_hint"),
-                    )
-                }
-            }
-
-            item(key = "write_pack_picker") {
-                AppCard(modifier = Modifier.fillMaxWidth()) {
-                    Column(verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
-                        Text(
-                            text = "目标词库",
-                            style = MaterialTheme.typography.titleSmall,
-                        )
-                        FilterChipGroup(
-                            options = listOf("") + state.packs.map { it.id },
-                            selected = state.targetPackId,
-                            onSelect = viewModel::selectPack,
-                            label = { packId ->
-                                if (packId.isEmpty()) {
-                                    "${PlanIds.WRITE_PACK_NAME}（默认）"
-                                } else {
-                                    state.packs.firstOrNull { it.id == packId }?.name ?: packId
-                                }
-                            },
-                            modifier = Modifier.testTag("write_pack_picker"),
-                        )
-                        Text(
-                            text = "不选则写入计划自带的「${PlanIds.WRITE_PACK_NAME}」，也可以写进任意已有词库。",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
+            item(key = "write_location") {
+                WriteLocationCard(
+                    state = state,
+                    onSelectPack = onSelectPack,
+                    onCreatePack = { showCreateDialog = true },
+                )
             }
 
             item(key = "write_input") {
                 AppCard(modifier = Modifier.fillMaxWidth()) {
                     Column(verticalArrangement = Arrangement.spacedBy(Spacing.md)) {
-                        OutlinedTextField(
-                            value = state.wordInput,
-                            onValueChange = viewModel::onWordChanged,
-                            label = { Text("单词") },
-                            singleLine = true,
-                            // Ascii maps to TYPE_TEXT_VARIATION_VISIBLE_PASSWORD, which makes
-                            // mainstream Chinese IMEs drop their pinyin composing state and show a
-                            // plain English layout, so the letters are visible as they are typed.
-                            // The input is deliberately NOT character-filtered: any filtering here
-                            // would also rewrite the IME's composing string mid-word.
-                            keyboardOptions = KeyboardOptions(
-                                keyboardType = KeyboardType.Ascii,
-                                imeAction = ImeAction.Done,
-                                capitalization = KeyboardCapitalization.None,
-                                autoCorrectEnabled = false,
-                            ),
-                            // "Done" commits straight from the word field, so a word-only entry
-                            // is one keystroke instead of Next → Done.
-                            keyboardActions = KeyboardActions(onDone = { viewModel.write() }),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .testTag("write_word_field")
-                                .focusRequester(wordFocus),
-                        )
+                        // The word itself is never typed here: all text entry happens in the
+                        // picker, so the form only shows the chosen word and an entry point.
+                        WordPickerField(word = state.wordInput, onOpenSearch = onOpenSearch)
                         OutlinedTextField(
                             value = state.noteInput,
-                            onValueChange = viewModel::onNoteChanged,
+                            onValueChange = onNoteChanged,
                             label = { Text("我的释义 / 注释（可选，中文）") },
                             minLines = 2,
                             maxLines = 4,
@@ -1055,7 +1069,7 @@ fun WriteWordScreen(
                                 keyboardType = KeyboardType.Text,
                                 imeAction = ImeAction.Done,
                             ),
-                            keyboardActions = KeyboardActions(onDone = { viewModel.write() }),
+                            keyboardActions = KeyboardActions(onDone = { onWrite() }),
                             supportingText = {
                                 Text("填写后会优先展示，覆盖词典里不符合语境的意思。")
                             },
@@ -1065,7 +1079,7 @@ fun WriteWordScreen(
                         )
                         PrimaryButton(
                             text = "写入",
-                            onClick = viewModel::write,
+                            onClick = onWrite,
                             enabled = state.wordInput.isNotBlank() && !state.saving,
                             loading = state.saving,
                             leadingIcon = Icons.Filled.Add,
@@ -1118,7 +1132,7 @@ fun WriteWordScreen(
                 item(key = "write_written_empty") {
                     EmptyState(
                         title = "还没有写入单词",
-                        description = "在上方输入一个单词，可附上自己的中文释义；写入后会立即出现在这里。",
+                        description = "点击上方的单词框搜索并选择单词，可附上自己的中文释义；写入后会立即出现在这里。",
                     )
                 }
             } else {
@@ -1131,24 +1145,431 @@ fun WriteWordScreen(
             }
         }
     }
+
+    if (showCreateDialog) {
+        NameDialog(
+            title = "新建词库",
+            label = "词库名称",
+            fieldTag = "write_new_pack_name",
+            initialName = "",
+            onConfirm = { name ->
+                showCreateDialog = false
+                onCreatePack(name)
+            },
+            onDismiss = { showCreateDialog = false },
+        )
+    }
 }
 
-/** One row of "本次已写入": the word, and the learner's own note when present. */
+/**
+ * 「写入位置」: the read-only plan, the target pack dropdown, and the in-card「新建」action.
+ *
+ * A dropdown instead of chips because the number of packs grows with every import, while the
+ * row must keep a fixed height; the picker stays paired with the create button on its right.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun WriteLocationCard(
+    state: WriteWordUiState,
+    onSelectPack: (String) -> Unit,
+    onCreatePack: () -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val selectedLabel = if (state.targetPackId.isEmpty()) {
+        "${PlanIds.WRITE_PACK_NAME}（默认）"
+    } else {
+        state.packs.firstOrNull { it.id == state.targetPackId }?.name ?: state.targetPackId
+    }
+
+    AppCard(modifier = Modifier.fillMaxWidth()) {
+        Column(verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
+            Text(text = "写入位置", style = MaterialTheme.typography.titleSmall)
+
+            // The plan is read-only context here: switching plans belongs to the plan screen.
+            Column(verticalArrangement = Arrangement.spacedBy(Spacing.xs)) {
+                Text(
+                    text = "所属计划",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = AppTheme.colors.mutedText,
+                )
+                Text(
+                    text = state.planName.ifBlank { state.planId },
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                ExposedDropdownMenuBox(
+                    expanded = expanded,
+                    onExpandedChange = { expanded = it },
+                    modifier = Modifier.weight(1f),
+                ) {
+                    OutlinedTextField(
+                        value = selectedLabel,
+                        onValueChange = {},
+                        readOnly = true,
+                        label = { Text("写入词库") },
+                        trailingIcon = {
+                            ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded)
+                        },
+                        modifier = Modifier
+                            .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
+                            .fillMaxWidth()
+                            .testTag("write_pack_dropdown"),
+                    )
+                    ExposedDropdownMenu(
+                        expanded = expanded,
+                        onDismissRequest = { expanded = false },
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("${PlanIds.WRITE_PACK_NAME}（默认）") },
+                            onClick = {
+                                expanded = false
+                                onSelectPack("")
+                            },
+                        )
+                        state.packs.forEach { pack ->
+                            DropdownMenuItem(
+                                text = { Text(pack.name) },
+                                onClick = {
+                                    expanded = false
+                                    onSelectPack(pack.id)
+                                },
+                            )
+                        }
+                    }
+                }
+                SecondaryButton(
+                    text = "新建",
+                    onClick = onCreatePack,
+                    leadingIcon = Icons.Filled.Add,
+                    modifier = Modifier.testTag("write_new_pack"),
+                )
+            }
+
+            Text(
+                text = "不选则写入计划自带的「${PlanIds.WRITE_PACK_NAME}」，也可以写进任意已有词库。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+/** Read-only word row; tapping it opens the full-screen picker (the only text-input surface). */
+@Composable
+private fun WordPickerField(
+    word: String,
+    onOpenSearch: () -> Unit,
+) {
+    Surface(
+        onClick = onOpenSearch,
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, AppTheme.colors.hairline),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("write_word_field"),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = Spacing.lg, vertical = Spacing.md),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(Spacing.xs),
+            ) {
+                Text(
+                    text = "单词",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = AppTheme.colors.mutedText,
+                )
+                Text(
+                    text = word.ifBlank { "点击搜索并选择单词" },
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = if (word.isBlank()) {
+                        AppTheme.colors.mutedText
+                    } else {
+                        MaterialTheme.colorScheme.onSurface
+                    },
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Spacer(Modifier.width(Spacing.sm))
+            Icon(
+                imageVector = Icons.Filled.KeyboardArrowRight,
+                contentDescription = null,
+                tint = AppTheme.colors.mutedText,
+            )
+        }
+    }
+}
+
+/**
+ * Full-screen picker over the gateway's `/dict` suggestions.
+ *
+ * Offline is not a dead end: the「直接使用」action is always available for a non-blank query, and
+ * the form never depends on a search having succeeded.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun WordSearchMode(
+    query: String,
+    hits: List<DictionaryHit>,
+    loading: Boolean,
+    error: String?,
+    errorIsConfig: Boolean,
+    settled: Boolean,
+    onQueryChange: (String) -> Unit,
+    onClear: () -> Unit,
+    onBack: () -> Unit,
+    onRetry: () -> Unit,
+    onSelect: (DictionaryHit) -> Unit,
+    onUseTyped: () -> Unit,
+) {
+    val focusRequester = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
+    LaunchedEffect(Unit) {
+        focusRequester.requestFocus()
+        keyboard?.show()
+    }
+
+    BackHandler {
+        // First press clears the text, the next leaves the picker — never pops the page.
+        if (query.isNotEmpty()) {
+            onClear()
+        } else {
+            keyboard?.hide()
+            onBack()
+        }
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .imePadding()
+                .navigationBarsPadding(),
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = Spacing.sm, vertical = Spacing.sm),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                IconButton(
+                    onClick = {
+                        keyboard?.hide()
+                        onBack()
+                    },
+                ) {
+                    Icon(Icons.Filled.ArrowBack, contentDescription = "返回")
+                }
+                OutlinedTextField(
+                    value = query,
+                    onValueChange = onQueryChange,
+                    placeholder = { Text("输入单词的前几个字母") },
+                    singleLine = true,
+                    // Ascii keeps mainstream Chinese IMEs on a plain English layout, so the
+                    // letters stay visible while typing (same reasoning as the old word field).
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Ascii,
+                        imeAction = ImeAction.Search,
+                        capitalization = KeyboardCapitalization.None,
+                        autoCorrectEnabled = false,
+                    ),
+                    keyboardActions = KeyboardActions(onSearch = { keyboard?.hide() }),
+                    trailingIcon = {
+                        if (query.isNotEmpty()) {
+                            IconButton(onClick = onClear) {
+                                Icon(Icons.Filled.Clear, contentDescription = "清空")
+                            }
+                        }
+                    },
+                    modifier = Modifier
+                        .weight(1f)
+                        .focusRequester(focusRequester)
+                        .testTag("write_search_field"),
+                )
+            }
+            HorizontalDivider(color = AppTheme.colors.hairline)
+
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+                contentAlignment = Alignment.Center,
+            ) {
+                when {
+                    query.isBlank() -> Text(
+                        text = "输入单词的前几个字母进行搜索",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = AppTheme.colors.mutedText,
+                        modifier = Modifier.testTag("write_search_guide"),
+                    )
+
+                    loading -> CircularProgressIndicator(
+                        modifier = Modifier.testTag("write_search_loading"),
+                    )
+
+                    error != null -> SearchErrorState(
+                        message = error,
+                        showRetry = !errorIsConfig,
+                        onRetry = onRetry,
+                    )
+
+                    settled && hits.isEmpty() -> Text(
+                        text = "没有匹配单词，可直接使用当前输入",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = AppTheme.colors.mutedText,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier
+                            .padding(horizontal = Spacing.xl)
+                            .testTag("write_search_empty"),
+                    )
+
+                    else -> LazyColumn(modifier = Modifier.fillMaxSize()) {
+                        items(hits, key = { hit -> hit.word }) { hit ->
+                            DictionaryHitRow(
+                                hit = hit,
+                                onClick = {
+                                    keyboard?.hide()
+                                    onSelect(hit)
+                                },
+                            )
+                            HorizontalDivider(color = AppTheme.colors.hairline)
+                        }
+                    }
+                }
+            }
+
+            if (query.isNotBlank()) {
+                SecondaryButton(
+                    text = "直接使用「${query.trim()}」",
+                    onClick = {
+                        keyboard?.hide()
+                        onUseTyped()
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = Spacing.lg, vertical = Spacing.md)
+                        .testTag("write_search_manual"),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SearchErrorState(
+    message: String,
+    showRetry: Boolean,
+    onRetry: () -> Unit,
+) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(Spacing.sm),
+        modifier = Modifier.padding(horizontal = Spacing.xl),
+    ) {
+        Text(
+            text = message,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error,
+            textAlign = TextAlign.Center,
+        )
+        if (showRetry) {
+            TextButton(
+                onClick = onRetry,
+                modifier = Modifier.testTag("write_search_retry"),
+            ) { Text("重试") }
+        }
+    }
+}
+
+/** One gateway candidate: word + phonetic on the first line, Chinese meaning on the second. */
+@Composable
+private fun DictionaryHitRow(
+    hit: DictionaryHit,
+    onClick: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = Spacing.lg, vertical = Spacing.md)
+            .testTag("write_search_hit_${hit.word}"),
+    ) {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = hit.word,
+                style = MaterialTheme.typography.titleMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (hit.phonetic.isNotBlank()) {
+                Text(
+                    text = hit.phonetic,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = AppTheme.colors.mutedText,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        if (hit.translation.isNotBlank()) {
+            Text(
+                text = hit.translation,
+                style = MaterialTheme.typography.bodySmall,
+                color = AppTheme.colors.mutedText,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = Spacing.xs),
+            )
+        }
+    }
+}
+
+/** One row of "本次已写入": the word on the left, note-or-meaning on the right. */
 @Composable
 private fun WrittenWordRow(
     entry: WrittenWordEntry,
     modifier: Modifier = Modifier,
 ) {
     AppCard(modifier = modifier.fillMaxWidth()) {
-        Column(verticalArrangement = Arrangement.spacedBy(Spacing.xs)) {
-            Text(text = entry.word, style = MaterialTheme.typography.titleSmall)
-            if (entry.note.isNotEmpty()) {
-                Text(
-                    text = entry.note,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = AppTheme.colors.mutedText,
-                )
-            }
+        Row(horizontalArrangement = Arrangement.spacedBy(Spacing.md)) {
+            Text(
+                text = entry.word,
+                style = MaterialTheme.typography.titleSmall,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                text = entry.secondaryText.orEmpty(),
+                style = MaterialTheme.typography.bodySmall,
+                // A note is the learner's own wording and must stay distinguishable from the
+                // dictionary meaning (which is why it is never shown alongside it).
+                color = if (entry.secondaryIsNote) {
+                    MaterialTheme.colorScheme.onSurface
+                } else {
+                    AppTheme.colors.mutedText
+                },
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
         }
     }
 }

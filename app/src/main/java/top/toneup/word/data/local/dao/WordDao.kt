@@ -311,4 +311,12 @@ interface WordDao {
         """,
     )
     suspend fun updateManualMeaning(id: Long, meanings: String, now: Long)
+
+    // === M7 write-word recent list ===========================================================
+    // Appended at the tail like the blocks above. The「写词库」list observes these rows instead
+    // of keeping an in-memory copy, so the gateway's write-back appears without leaving the page.
+    // Callers must not pass an empty list (SQLite has no `IN ()`); the repository short-circuits.
+
+    @Query("SELECT * FROM word WHERE id IN (:ids)")
+    fun observeByIds(ids: List<Long>): Flow<List<WordEntity>>
 }

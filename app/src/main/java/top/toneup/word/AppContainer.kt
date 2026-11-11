@@ -31,6 +31,8 @@ import top.toneup.word.data.repository.DefaultMistakeRepository
 import top.toneup.word.data.repository.DefaultStatsRepository
 import top.toneup.word.data.repository.DefaultStudyRepository
 import top.toneup.word.data.repository.DefaultWordRepository
+import top.toneup.word.data.repository.DefaultDictionarySearchRepository
+import top.toneup.word.data.repository.DictionarySearchRepository
 import top.toneup.word.data.repository.ExamRepository
 import top.toneup.word.data.repository.MistakeRepository
 import top.toneup.word.data.repository.ProgressRecorder
@@ -63,6 +65,11 @@ class AppContainer(
      * test run never touches the user's real data and can be asserted on directly.
      */
     databaseOverride: ToneUpWordDatabase? = null,
+    /**
+     * Injection seam for tests: the full-screen picker's `/dict` search. Production passes
+     * `null` and gets the real gateway client; a UI test can answer without a network.
+     */
+    dictionarySearchOverride: DictionarySearchRepository? = null,
 ) {
 
     val timeProvider: TimeProvider = SystemTimeProvider()
@@ -192,6 +199,14 @@ class AppContainer(
         time = timeProvider,
         json = gatewayJson,
     )
+
+    /**
+     * The same gateway's `/dict` endpoint used as a **search** (prefix suggestions for the
+     * full-screen word picker). Deliberately separate from [meaningLookupService]: it never
+     * cascades and never reads or writes `meaning_cache`.
+     */
+    val dictionarySearchRepository: DictionarySearchRepository =
+        dictionarySearchOverride ?: DefaultDictionarySearchRepository(gatewayClientProvider)
 
     /**
      * Orchestration for meaning completion: pending counter, unique-work enqueue, immediate

@@ -12,6 +12,7 @@ import top.toneup.word.data.local.entity.ImportHistoryEntity
 import top.toneup.word.data.local.entity.PlanEntity
 import top.toneup.word.data.local.entity.WordEntity
 import top.toneup.word.data.local.entity.WordPackEntity
+import top.toneup.word.data.mapper.toDomain
 import top.toneup.word.data.mapper.toEntity
 import top.toneup.word.data.mapper.toWord
 import top.toneup.word.data.mapper.toWordWithProgress
@@ -29,6 +30,7 @@ import top.toneup.word.domain.model.WordWithProgress
 import top.toneup.word.domain.search.ApproximateWordMatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
@@ -188,6 +190,15 @@ interface WordRepository {
         note: String,
         now: Long,
     ): Outcome<Long>
+
+    /**
+     * Observes the given word rows so the「写词库」list follows automated write-backs.
+     *
+     * The list must show the dictionary meaning that `MeaningSyncWorker` stores **after** the
+     * page was opened, so it is a live Room query instead of an in-memory snapshot. An empty id
+     * set emits an empty list without a query.
+     */
+    fun observeWordsByIds(ids: List<Long>): Flow<List<Word>>
 
     /**
      * Vocabulary lookup for the word browser.
@@ -523,6 +534,14 @@ class DefaultWordRepository(
     override fun observeWordCount(planId: String): Flow<Int> = db.wordDao().observePlanWordCount(planId)
 
     override fun observePacks(planId: String): Flow<List<WordPackEntity>> = db.wordDao().observePacks(planId)
+
+    override fun observeWordsByIds(ids: List<Long>): Flow<List<Word>> =
+        if (ids.isEmpty()) {
+            // Never hand SQLite an empty `IN ()` list; "nothing written yet" is simply empty.
+            flowOf(emptyList<Word>())
+        } else {
+            db.wordDao().observeByIds(ids).map { rows -> rows.map { it.toDomain() } }
+        }
 
     override fun observeAllPacks(): Flow<List<WordPackEntity>> = db.wordDao().observeAllPacks()
 
